@@ -1,6 +1,5 @@
 #include <iostream>
 #include <fstream>
-#include <sched.h>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -8,16 +7,11 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
-#include <functional>
-#include <map>
-#include <chrono>
-
 #include <queue>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
 #include <cerrno>
-#include <cassert>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -25,29 +19,26 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
-#include <sys/file.h>     // flock
+#include <sys/file.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
-#include <syslog.h>
-
-
 
 /* ─────────────────────────────────────────────
    Constants
    ───────────────────────────────────────────── */
-static const int    TIMEOUT_SEC    = 5;   // 2PC phase timeout
-static const char*  SAFE_DIR       = "run";
-static const char*  PID_FILE       = "run/rbbserv.pid";
-static const char*  LOG_FILE       = "run/bbserv.log";
-static const char*  DEFAULT_CONF   = "bbserv.conf";
+static const int    TIMEOUT_SEC  = 5;
+static const char*  SAFE_DIR     = "run";
+static const char*  PID_FILE     = "run/rbbserv.pid";
+static const char*  LOG_FILE     = "run/bbserv.log";
+static const char*  DEFAULT_CONF = "bbserv.conf";
 
 /* ─────────────────────────────────────────────
    Config
    ───────────────────────────────────────────── */
 struct Peer { std::string host; int port; };
 
-struct Config { 
+struct Config {
     int  thmax      = 25;
     int  thincr     = 5;
     int  bbport     = 9000;
@@ -59,46 +50,47 @@ struct Config {
 };
 
 /* Global state */
-Config      g_cfg;
-std::string g_configPath  = DEFAULT_CONF;
-std::mutex  g_logMtx;
-int         g_pidFd       = -1;
-FILE*       g_logFp       = nullptr;   // null → use stdout
+Config            g_cfg;
+std::string       g_configPath = DEFAULT_CONF;
+std::mutex        g_logMtx;
+int               g_pidFd      = -1;
+FILE*             g_logFp      = nullptr;
 
-// THE ATOMICSSS !!!!
-std::atomic<int> g_nextId{1};
+std::atomic<int>  g_nextId{1};
 std::atomic<bool> g_doRestart{false};
 std::atomic<bool> g_doQuit{false};
 
-
-
-
-/*
- * Initialization yayyy
- *  + helpers of course 
- */
-
+/* ─────────────────────────────────────────────
+   Helpers
+   ───────────────────────────────────────────── */
 bool strToBool(const std::string& s) {
     return s == "true" || s == "1";
 }
 
-/*
-    removes \r and \n from the end of a string
-*/
 std::string trimCR(const std::string& s) {
     std::string out = s;
-
     while (!out.empty() && (out.back() == '\r' || out.back() == '\n')) {
         out.pop_back();
     }
-
     return out;
 }
 
-/* The actual stuff */
+void logMsg(const std::string& msg) {
+    std::lock_guard<std::mutex> lk(g_logMtx);
+    if (g_logFp) {
+        fprintf(g_logFp, "%s\n", msg.c_str());
+        fflush(g_logFp);
+    } else {
+        fprintf(stdout, "%s\n", msg.c_str());
+        fflush(stdout);
+    }
+}
+
+/* ─────────────────────────────────────────────
+   Initialize
+   ───────────────────────────────────────────── */
 bool initialize(const char* configPath, Config& cfg) {
     int fd = open(configPath, O_RDONLY);
-
     if (fd < 0) {
         perror("open config");
         return false;
@@ -109,7 +101,6 @@ bool initialize(const char* configPath, Config& cfg) {
 
     while (true) {
         ssize_t n = read(fd, buf, sizeof(buf));
-
         if (n > 0) {
             file.append(buf, static_cast<size_t>(n));
         }
@@ -123,11 +114,9 @@ bool initialize(const char* configPath, Config& cfg) {
             return false;
         }
     }
-
     close(fd);
 
     std::size_t start = 0;
-
     while (start < file.size()) {
         std::size_t end = file.find('\n', start);
         if (end == std::string::npos) end = file.size();
@@ -149,12 +138,6 @@ bool initialize(const char* configPath, Config& cfg) {
             else if (key == "BBPORT" && !val.empty()) {
                 cfg.bbport = std::stoi(val);
             }
-            else if (key == "PDEBUG" && !val.empty()) {
-                cfg.pdebug = strToBool(val);
-            }
-            else if (key == "BBFILE" && !val.empty()) {
-                cfg.bbfile = val;
-            }
             else if (key == "FOREGROUND" && !val.empty()) {
                 cfg.foreground = strToBool(val);
             }
@@ -163,6 +146,9 @@ bool initialize(const char* configPath, Config& cfg) {
             }
             else if (key == "RPORT" && !val.empty()) {
                 cfg.rport = std::stoi(val);
+            }
+            else if (key == "BBFILE" && !val.empty()) {
+                cfg.bbfile = val;
             }
             else if (key == "PEER" && !val.empty()) {
                 auto col = val.rfind(':');
@@ -199,63 +185,61 @@ bool initialize(const char* configPath, Config& cfg) {
     return true;
 }
 
-// MAIN HELPERS 
-
-void daemonize(){
+/* ─────────────────────────────────────────────
+   Daemonize
+   ───────────────────────────────────────────── */
+void daemonize() {
     pid_t pid = fork();
-    if(pid > 0 ){
-        exit(0);
-    }
-    setsid();
+    if (pid < 0) { perror("fork"); exit(1); }
+    if (pid > 0) exit(0);
+
+    if (setsid() < 0) { perror("setsid"); exit(1); }
+
     pid = fork();
-    if(pid > 0){
-        exit(0);
-    }
+    if (pid < 0) { perror("fork2"); exit(1); }
+    if (pid > 0) exit(0);
 
-    int maxFD = sysconf(_SC_OPEN_MAX);
-
-    for (int i = 3; i < maxFD; i++) {
-        close(i);
-    }
+    int maxFd = (int)sysconf(_SC_OPEN_MAX);
+    if (maxFd < 0) maxFd = 1024;
+    for (int i = 3; i < maxFd; i++) close(i);
 
     int devNull = open("/dev/null", O_RDWR);
-    dup2(devNull, STDIN_FILENO);
-    dup2(devNull, STDOUT_FILENO);
-    dup2(devNull, STDERR_FILENO);
-}
-
-void initNextId() {
-    std::ifstream in(g_cfg.bbfile);
-    int maxId = 0;
-    std::string line;
-    while (std::getline(in, line)) {
-        auto slash = line.find('/');
-        if (slash == std::string::npos) continue;
-        try {
-            int id = std::stoi(line.substr(0, slash));
-            if (id > maxId) maxId = id;
-        } catch (...) {}
+    if (devNull >= 0) {
+        dup2(devNull, STDIN_FILENO);
+        dup2(devNull, STDOUT_FILENO);
+        dup2(devNull, STDERR_FILENO);
+        if (devNull > 2) close(devNull);
     }
-    g_nextId = maxId + 1;
 }
 
-void runserver(){
-    
+/* ─────────────────────────────────────────────
+   PID file
+   ───────────────────────────────────────────── */
+void removePidFile() {
+    if (g_pidFd >= 0) {
+        flock(g_pidFd, LOCK_UN);
+        close(g_pidFd);
+        g_pidFd = -1;
+    }
+    unlink(PID_FILE);
 }
 
+/* ─────────────────────────────────────────────
+   Signals
+   ───────────────────────────────────────────── */
 void sigHandler(int sig) {
     if (sig == SIGHUP)  g_doRestart = true;
-    if (sig == SIGQUIT) g_doQuit = true;
-    if (sig == SIGINT)  g_doQuit = true;
+    if (sig == SIGQUIT) g_doQuit    = true;
+    if (sig == SIGINT)  g_doQuit    = true;
 }
 
 void setupSignals(bool foreground) {
     struct sigaction sa{};
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
+    sa.sa_flags   = 0;
     sa.sa_handler = sigHandler;
 
-    sigaction(SIGHUP, &sa, nullptr);
+    sigaction(SIGHUP,  &sa, nullptr);
     sigaction(SIGQUIT, &sa, nullptr);
 
     if (foreground) {
@@ -273,67 +257,85 @@ void setupSignals(bool foreground) {
     sigaction(SIGTTOU, &sa, nullptr);
 }
 
-void logMsg(const std::string& msg) {
-    std::lock_guard<std::mutex> lk(g_logMtx);
-    if (g_logFp) {
-        fprintf(g_logFp, "%s\n", msg.c_str());
-        fflush(g_logFp);
-    } else {
-        fprintf(stdout, "%s\n", msg.c_str());
-        fflush(stdout);
+/* ─────────────────────────────────────────────
+   Next message ID
+   ───────────────────────────────────────────── */
+void initNextId() {
+    std::ifstream in(g_cfg.bbfile);
+    int maxId = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        auto slash = line.find('/');
+        if (slash == std::string::npos) continue;
+        try {
+            int id = std::stoi(line.substr(0, slash));
+            if (id > maxId) maxId = id;
+        } catch (...) {}
     }
+    g_nextId = maxId + 1;
 }
-int main(int argc, char* argv[]){ 
+
+/* ─────────────────────────────────────────────
+   Run server
+   ───────────────────────────────────────────── */
+void runServer() {
+
+}
+
+/* ─────────────────────────────────────────────
+   Main
+   ───────────────────────────────────────────── */
+int main(int argc, char* argv[]) {
     const char* path = DEFAULT_CONF;
-    if(argc > 2){
-        std::cout << "you must run with wither none or one argument, which should be the path to the configuration file\n exiting...\n";
+
+    if (argc > 2) {
+        std::cout << "Usage: rbbserv [config-file]\n";
         return 1;
     }
 
-    
-    if(argc == 2 ){
+    if (argc == 2) {
         path = argv[1];
         int fd = open(path, O_RDONLY);
         if (fd < 0) {
-            std::cerr << "Error: cannot open config file or does not exist : " << path << "\n";
+            std::cerr << "Error: cannot open config file: " << path << "\n";
             return 1;
         }
         close(fd);
     }
 
-
-    //initiall steps
-    if(!initialize(path, g_cfg)){
-        std::cout << "Initialize did not work ending program! ";
+    if (!initialize(path, g_cfg)) {
+        std::cerr << "Initialize failed, exiting\n";
+        return 1;
     }
 
-    // make the directory 
-    mkdir("run", 0755);
+    mkdir(SAFE_DIR, 0755);
 
-    // 
-    if(!g_cfg.foreground){
+    if (!g_cfg.foreground) {
         daemonize();
-        g_logFp = fopen(LOG_FILE,"a");
+        g_logFp = fopen(LOG_FILE, "a");
     }
+
     g_pidFd = open(PID_FILE, O_RDWR | O_CREAT, 0644);
-    if(g_pidFd < 0 ){
-        perror("Fail pid file");
+    if (g_pidFd < 0) {
+        perror("open pid file");
         return 1;
     }
-    if(flock(g_pidFd,LOCK_EX | LOCK_NB) < 0){
-        perror("server already runnning");
+
+    if (flock(g_pidFd, LOCK_EX | LOCK_NB) < 0) {
+        std::cerr << "Server already running\n";
+        close(g_pidFd);
         return 1;
     }
+
     ftruncate(g_pidFd, 0);
     lseek(g_pidFd, 0, SEEK_SET);
-    int size = 32;
-    char buf[size];
-    int n = snprintf(buf, size,"%d\n", (int)getpid());
-    write(g_pidFd, buf, size);
+    char buf[32];
+    int n = snprintf(buf, 32, "%d\n", (int)getpid());
+    write(g_pidFd, buf, (size_t)n);
     fsync(g_pidFd);
 
-    if(chdir("run") != 0){
-        perror("chdir not working");
+    if (chdir(SAFE_DIR) != 0) {
+        perror("chdir");
         return 1;
     }
 
@@ -341,35 +343,30 @@ int main(int argc, char* argv[]){
         g_cfg.bbfile = "../" + g_cfg.bbfile;
     }
 
-    int bbfd = open(g_cfg.bbfile.c_str(),O_RDWR | O_CREAT, 0644 );
-    if(bbfd >= 0){
-        close(bbfd);
-    }
+    int bbfd = open(g_cfg.bbfile.c_str(), O_RDWR | O_CREAT, 0644);
+    if (bbfd >= 0) close(bbfd);
 
     initNextId();
 
     setupSignals(g_cfg.foreground);
 
-    while(true){
-        g_doQuit = false;
+    while (true) {
+        g_doQuit    = false;
         g_doRestart = false;
 
-        runserver();
+        runServer();
 
-        if(g_doQuit){
-            logMsg("server shuttinmg down");
+        if (g_doQuit) {
+            logMsg("Server shutting down");
             break;
         }
         if (g_doRestart) {
-            logMsg("server restart initiated");
+            logMsg("Server restarting");
             initialize(path, g_cfg);
         }
     }
 
-    flock(g_pidFd, LOCK_UN);
-    fclose(g_logFp);
+    removePidFile();
+    if (g_logFp) fclose(g_logFp);
     return 0;
 }
-
-
-
