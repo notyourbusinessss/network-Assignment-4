@@ -1,3 +1,4 @@
+#include <asm-generic/socket.h>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -278,7 +279,45 @@ void initNextId() {
 /* ─────────────────────────────────────────────
    Run server
    ───────────────────────────────────────────── */
+
+    //helper
+    int makeListener(int port){
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if(fd < 0){
+            perror("OH NO SOCKET PROBLEMS!!");
+            return -1;
+        }
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        sockaddr_in addr{};
+        addr.sin_family =AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port = htons((uint16_t)port);
+        
+        if(bind(fd,(sockaddr*)&addr,sizeof(addr)) < 0){
+            perror("bind error");
+            close(fd);
+            return -1;
+        }
+
+        if (listen(fd,64) < 0) {
+            perror("listening error");
+            close(fd);
+            return -1;
+        }
+
+        return fd;
+
+    }
+
+    //The function itself
 void runServer() {
+    int client = makeListener(g_cfg.bbport);
+    int replica = makeListener(g_cfg.bbport);
+
+
+    //create pool 
+    
 
 }
 
