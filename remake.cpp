@@ -1,4 +1,4 @@
-#include <asm-generic/socket.h>
+
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -57,9 +57,16 @@ std::mutex        g_logMtx;
 int               g_pidFd      = -1;
 FILE*             g_logFp      = nullptr;
 
+std::vector<std::thread> g_workers;
+
+std::queue<int>          g_queue;
+std::mutex               g_queueMtx;
+std::condition_variable  g_queueCv;
+
 std::atomic<int>  g_nextId{1};
 std::atomic<bool> g_doRestart{false};
 std::atomic<bool> g_doQuit{false};
+
 
 /* ─────────────────────────────────────────────
    Helpers
@@ -281,6 +288,388 @@ void initNextId() {
    ───────────────────────────────────────────── */
 
     //helper
+
+    bool sendLine(int fd, const std::string& line) {
+    std::string out = line + "\n";
+    size_t sent = 0;
+    while (sent < out.size()) {
+        ssize_t n = send(fd, out.c_str() + sent, out.size() - sent, 0);
+        if (n > 0) {
+            sent += (size_t)n;
+        }
+        else if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        else {
+            return false;
+        }
+    }
+    if (g_cfg.pdebug) logMsg("SEND [" + line + "]");
+    return true;
+}
+
+bool recvLine(int fd, std::string& line) {
+    line.clear();
+    char ch;
+    while (true) {
+        ssize_t n = recv(fd, &ch, 1, 0);
+        if (n == 0) {
+            return false;
+        }
+        else if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (ch == '\n') break;
+        if (ch != '\r') line.push_back(ch);
+    }
+    if (g_cfg.pdebug) logMsg("RECV [" + line + "]");
+    return true;
+}
+
+bool readMessageById(int id, std::string& out) {
+    std::ifstream in(g_cfg.bbfile);
+    if (!in.is_open()) return false;
+    std::string line;
+    while (std::getline(in, line)) {
+        auto sl = line.find('/');
+        if (sl == std::string::npos) continue;
+        try {
+            if (std::stoi(line.substr(0, sl)) == id) {
+                out = line.substr(sl + 1);
+                return true;
+            }
+        } catch (...) {}
+    }
+    return false;
+}
+
+bool appendMessage(const std::string& poster, const std::string& msg, int& assignedId) {
+    std::ofstream out(g_cfg.bbfile, std::ios::app);
+    if (!out.is_open()) return false;
+    assignedId = g_nextId.fetch_add(1);
+    out << assignedId << "/" << poster << "/" << msg << "\n";
+    out.flush();
+    return out.good();
+}
+
+bool replaceMessage(int id, const std::string& poster, const std::string& msg) {
+    std::ifstream in(g_cfg.bbfile);
+    if (!in.is_open()) return false;
+
+    std::vector<std::string> lines;
+    std::string line;
+    bool found = false;
+
+    while (std::getline(in, line)) {
+        auto sl = line.find('/');
+        if (sl != std::string::npos) {
+            try {
+                if (std::stoi(line.substr(0, sl)) == id) {
+                    lines.push_back(std::to_string(id) + "/" + poster + "/" + msg);
+                    found = true;
+                    continue;
+                }
+            } catch (...) {}
+        }
+        lines.push_back(line);
+    }
+    in.close();
+
+    if (!found) return false;
+
+    std::ofstream out(g_cfg.bbfile, std::ios::trunc);
+    for (auto& l : lines) out << l << "\n";
+    out.flush();
+    return true;
+}
+
+bool recvLineTimeout(int fd, std::string& line, int timeoutSec) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(fd, &fds);
+    struct timeval tv{ timeoutSec, 0 };
+    int r = select(fd + 1, &fds, nullptr, nullptr, &tv);
+    if (r <= 0) return false;
+    return recvLine(fd, line);
+}
+
+int connectTCP(const std::string& host, int port) {
+    addrinfo hints{};
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    addrinfo* res = nullptr;
+    std::string portStr = std::to_string(port);
+    if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res) != 0) return -1;
+
+    int fd = -1;
+    for (addrinfo* p = res; p; p = p->ai_next) {
+        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd < 0) continue;
+
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        int rc = connect(fd, p->ai_addr, p->ai_addrlen);
+        if (rc == 0) {
+            fcntl(fd, F_SETFL, flags);
+            break;
+        }
+        if (errno == EINPROGRESS) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(fd, &wfds);
+            struct timeval tv{ TIMEOUT_SEC, 0 };
+            if (select(fd + 1, nullptr, &wfds, nullptr, &tv) > 0) {
+                int err = 0;
+                socklen_t len = sizeof(err);
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+                if (err == 0) {
+                    fcntl(fd, F_SETFL, flags);
+                    break;
+                }
+            }
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+void undoWrite(int id) {
+    std::ifstream in(g_cfg.bbfile);
+    if (!in.is_open()) return;
+
+    std::vector<std::string> lines;
+    std::string line;
+    bool removed = false;
+
+    while (std::getline(in, line)) {
+        auto sl = line.find('/');
+        if (!removed && sl != std::string::npos) {
+            try {
+                if (std::stoi(line.substr(0, sl)) == id) {
+                    removed = true;
+                    continue;
+                }
+            } catch (...) {}
+        }
+        lines.push_back(line);
+    }
+    in.close();
+
+    if (removed) {
+        std::ofstream out(g_cfg.bbfile, std::ios::trunc);
+        for (auto& l : lines) out << l << "\n";
+    }
+}
+
+int twoPhaseWrite(const std::string& poster, const std::string& msg, int& assignedId) {
+    std::vector<int> slaveFds;
+
+    // phase 1 - precommit
+    for (auto& p : g_cfg.peers) {
+        int fd = connectTCP(p.host, p.port);
+        if (fd < 0) {
+            logMsg("[2PC] cannot connect to " + p.host + ":" + std::to_string(p.port));
+            for (int sfd : slaveFds) { sendLine(sfd, "2PC ABORT"); close(sfd); }
+            return -1;
+        }
+        sendLine(fd, "2PC PRECOMMIT");
+        std::string resp;
+        if (!recvLineTimeout(fd, resp, TIMEOUT_SEC) || resp != "2PC ACK OK") {
+            logMsg("[2PC] precommit failed from " + p.host);
+            close(fd);
+            for (int sfd : slaveFds) { sendLine(sfd, "2PC ABORT"); close(sfd); }
+            return -1;
+        }
+        slaveFds.push_back(fd);
+    }
+
+    // phase 2 - commit
+    std::string commitMsg = "2PC COMMIT WRITE " + poster + " " + msg;
+    for (int fd : slaveFds) sendLine(fd, commitMsg);
+
+    bool masterOk = appendMessage(poster, msg, assignedId);
+
+    bool allOk = masterOk;
+    for (int fd : slaveFds) {
+        std::string resp;
+        if (!recvLineTimeout(fd, resp, TIMEOUT_SEC) || resp != "2PC DONE OK") {
+            allOk = false;
+        }
+    }
+
+    if (allOk) {
+        for (int fd : slaveFds) { sendLine(fd, "2PC SUCCESS"); close(fd); }
+        return 0;
+    } else {
+        for (int fd : slaveFds) { sendLine(fd, "2PC UNSUCCESS"); close(fd); }
+        if (masterOk) {
+            // undo local write
+            undoWrite(assignedId);
+        }
+        return -1;
+    }
+}
+
+int twoPhaseReplace(int id, const std::string& poster, const std::string& msg) {
+    std::vector<int> slaveFds;
+
+    // phase 1 - precommit
+    for (auto& p : g_cfg.peers) {
+        int fd = connectTCP(p.host, p.port);
+        if (fd < 0) {
+            logMsg("[2PC] cannot connect to " + p.host + ":" + std::to_string(p.port));
+            for (int sfd : slaveFds) { sendLine(sfd, "2PC ABORT"); close(sfd); }
+            return -1;
+        }
+        sendLine(fd, "2PC PRECOMMIT");
+        std::string resp;
+        if (!recvLineTimeout(fd, resp, TIMEOUT_SEC) || resp != "2PC ACK OK") {
+            logMsg("[2PC] precommit failed from " + p.host);
+            close(fd);
+            for (int sfd : slaveFds) { sendLine(sfd, "2PC ABORT"); close(sfd); }
+            return -1;
+        }
+        slaveFds.push_back(fd);
+    }
+
+    // phase 2 - commit
+    std::string commitMsg = "2PC COMMIT REPLACE " + std::to_string(id) + " " + poster + " " + msg;
+    for (int fd : slaveFds) sendLine(fd, commitMsg);
+
+    // save original for rollback
+    std::string origContent;
+    bool existed = readMessageById(id, origContent);
+    bool masterOk = existed && replaceMessage(id, poster, msg);
+
+    bool allOk = masterOk;
+    for (int fd : slaveFds) {
+        std::string resp;
+        if (!recvLineTimeout(fd, resp, TIMEOUT_SEC) || resp != "2PC DONE OK") {
+            allOk = false;
+        }
+    }
+
+    if (allOk) {
+        for (int fd : slaveFds) { sendLine(fd, "2PC SUCCESS"); close(fd); }
+        return 0;
+    } else {
+        for (int fd : slaveFds) { sendLine(fd, "2PC UNSUCCESS"); close(fd); }
+        if (masterOk) {
+            // restore original
+            auto sl = origContent.find('/');
+            if (sl != std::string::npos) {
+                std::string origPoster = origContent.substr(0, sl);
+                std::string origMsg   = origContent.substr(sl + 1);
+                replaceMessage(id, origPoster, origMsg);
+            }
+        }
+        return -1;
+    }
+}
+
+
+
+    void handleClient(int clientFd) {
+    std::string currentUser = "anonymous coward";
+
+    sendLine(clientFd, "0.0 WELCOME ver 1.0: USER READ WRITE REPLACE QUIT spoken here");
+
+    std::string line;
+    while (recvLine(clientFd, line)) {
+        if (g_doQuit || g_doRestart) break;
+
+        if (line.rfind("USER ", 0) == 0) {
+            std::string name = line.substr(5);
+            if (name.find('/') != std::string::npos) {
+                sendLine(clientFd, "1.2 BAD " + name + " invalid user name");
+            } else {
+                currentUser = name;
+                sendLine(clientFd, "1.0 HELLO " + name + " welcome");
+            }
+        }
+        else if (line.rfind("READ ", 0) == 0) {
+            std::string numStr = line.substr(5);
+            try {
+                int id = std::stoi(numStr);
+                std::string content;
+                bool found = readMessageById(id, content);
+                if (found) {
+                    sendLine(clientFd, "2.0 MESSAGE " + std::to_string(id) + " " + content);
+                } else {
+                    sendLine(clientFd, "2.1 UNKNOWN " + std::to_string(id) + " no such message");
+                }
+            } catch (...) {
+                sendLine(clientFd, "2.2 ERROR READ invalid message number");
+            }
+        }
+        else if (line.rfind("WRITE ", 0) == 0) {
+            std::string message = line.substr(6);
+            int newId = 0;
+            if (g_cfg.peers.empty()) {
+                if (appendMessage(currentUser, message, newId)) {
+                    sendLine(clientFd, "3.0 WROTE " + std::to_string(newId));
+                } else {
+                    sendLine(clientFd, "3.2 ERROR WRITE could not store message");
+                }
+            } else {
+                if (twoPhaseWrite(currentUser, message, newId) == 0) {
+                    sendLine(clientFd, "3.0 WROTE " + std::to_string(newId));
+                } else {
+                    sendLine(clientFd, "3.2 ERROR WRITE replication failed");
+                }
+            }
+        }
+        else if (line.rfind("REPLACE ", 0) == 0) {
+            // format: REPLACE <id>/<poster>/<message>
+            std::string rest = line.substr(8);
+            auto sl1 = rest.find('/');
+            auto sl2 = (sl1 != std::string::npos) ? rest.find('/', sl1 + 1) : std::string::npos;
+            if (sl1 == std::string::npos || sl2 == std::string::npos) {
+                sendLine(clientFd, "3.2 ERROR REPLACE bad format");
+            } else {
+                try {
+                    int id             = std::stoi(rest.substr(0, sl1));
+                    std::string poster = rest.substr(sl1 + 1, sl2 - sl1 - 1);
+                    std::string msg    = rest.substr(sl2 + 1);
+                    if (g_cfg.peers.empty()) {
+                        if (replaceMessage(id, poster, msg)) {
+                            sendLine(clientFd, "3.0 REPLACED " + std::to_string(id));
+                        } else {
+                            sendLine(clientFd, "3.2 ERROR REPLACE no such message");
+                        }
+                    } else {
+                        if (twoPhaseReplace(id, poster, msg) == 0) {
+                            sendLine(clientFd, "3.0 REPLACED " + std::to_string(id));
+                        } else {
+                            sendLine(clientFd, "3.2 ERROR REPLACE replication failed");
+                        }
+                    }
+                } catch (...) {
+                    sendLine(clientFd, "3.2 ERROR REPLACE bad message id");
+                }
+            }
+        }
+        else if (line.rfind("QUIT", 0) == 0) {
+            sendLine(clientFd, "9.0 BYE goodbye");
+            shutdown(clientFd, SHUT_RDWR);
+            close(clientFd);
+            return;
+        }
+        else {
+            sendLine(clientFd, "5.0 ERROR unknown command");
+        }
+    }
+
+    sendLine(clientFd, "9.0 BYE goodbye");
+    shutdown(clientFd, SHUT_RDWR);
+    close(clientFd);
+}
+
     int makeListener(int port){
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         if(fd < 0){
@@ -310,15 +699,86 @@ void initNextId() {
 
     }
 
-    //The function itself
+    void workerLoop() {
+    while (true) {
+        int fd;
+        {
+            std::unique_lock<std::mutex> lk(g_queueMtx);
+            g_queueCv.wait(lk, []{ return !g_queue.empty() || g_doQuit; });
+            if (g_doQuit && g_queue.empty()) return;
+            fd = g_queue.front();
+            g_queue.pop();
+        }
+        handleClient(fd);
+    }
+}
+
+void spawnThreads(int n) {
+    for (int i = 0; i < n; i++) {
+        g_workers.emplace_back(workerLoop);
+    }
+}
+
+void enqueueClient(int fd) {
+    std::lock_guard<std::mutex> lk(g_queueMtx);
+    g_queue.push(fd);
+    g_queueCv.notify_one();
+}
+
 void runServer() {
-    int client = makeListener(g_cfg.bbport);
-    int replica = makeListener(g_cfg.bbport);
+    int clientFd = makeListener(g_cfg.bbport);
+    if (clientFd < 0) {
+        logMsg("ERROR: cannot bind client port");
+        return;
+    }
 
+    int replicaFd = makeListener(g_cfg.rport);
+    if (replicaFd < 0) {
+        logMsg("ERROR: cannot bind replica port");
+        return;
+    }
 
-    //create pool 
-    
+    spawnThreads(g_cfg.thincr);
 
+    // step 4 - replica accept loop (background thread)
+    // step 5 - log
+    logMsg("Server listening on client port " + std::to_string(g_cfg.bbport)
+           + " replica port " + std::to_string(g_cfg.rport));
+
+    // step 6 - client accept loop
+    while (!g_doQuit && !g_doRestart) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(clientFd, &fds);
+        struct timeval tv{1, 0};
+        int r = select(clientFd + 1, &fds, nullptr, nullptr, &tv);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) continue;
+
+        int newFd = accept(clientFd, nullptr, nullptr);
+        if (newFd < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        // grow pool if needed
+        if ((int)g_workers.size() < g_cfg.thmax) {
+            spawnThreads(g_cfg.thincr);
+        }
+
+        enqueueClient(newFd);
+    }
+
+    // step 7 - clean up
+    g_doQuit = true;
+    g_queueCv.notify_all();
+    for (auto& t : g_workers) {
+        if (t.joinable()) t.join();
+    }
+    g_workers.clear();
+
+    close(clientFd);
+    close(replicaFd);
 }
 
 /* ─────────────────────────────────────────────
