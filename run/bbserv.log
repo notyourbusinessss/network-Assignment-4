@@ -1,3 +1,0 @@
-server shuttinmg down
-rbbserv starting on client-port=7777 replica-port=9001 peers=0
-Listening: clients=7777 replicas=9001
