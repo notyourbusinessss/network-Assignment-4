@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <queue>
+#include <algorithm>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
@@ -53,6 +54,7 @@ struct Config {
 /* Global state */
 Config            g_cfg;
 std::string       g_configPath = DEFAULT_CONF;
+std::string       g_origCwd;     // cwd at startup, for resolving relative BBFILE after chdir / SIGHUP
 std::mutex        g_logMtx;
 int               g_pidFd      = -1;
 FILE*             g_logFp      = nullptr;
@@ -102,6 +104,12 @@ void logMsg(const std::string& msg) {
    Initialize
    ───────────────────────────────────────────── */
 bool initialize(const char* configPath, Config& cfg) {
+    // Parse into a local Config so a failed reload doesn't clobber the
+    // currently-running configuration. On success we move the result into cfg,
+    // which also ensures PEER lines and other fields don't accumulate across
+    // SIGHUP reloads.
+    Config next;
+
     int fd = open(configPath, O_RDONLY);
     if (fd < 0) {
         perror("open config");
@@ -142,25 +150,25 @@ bool initialize(const char* configPath, Config& cfg) {
             ss >> key >> val;
 
             if (key == "THMAX" && !val.empty()) {
-                cfg.thmax = std::stoi(val);
+                next.thmax = std::stoi(val);
             }
             else if (key == "THINCR" && !val.empty()) {
-                cfg.thincr = std::stoi(val);
+                next.thincr = std::stoi(val);
             }
             else if (key == "BBPORT" && !val.empty()) {
-                cfg.bbport = std::stoi(val);
+                next.bbport = std::stoi(val);
             }
             else if (key == "FOREGROUND" && !val.empty()) {
-                cfg.foreground = strToBool(val);
+                next.foreground = strToBool(val);
             }
             else if (key == "PDEBUG" && !val.empty()) {
-                cfg.pdebug = strToBool(val);
+                next.pdebug = strToBool(val);
             }
             else if (key == "RPORT" && !val.empty()) {
-                cfg.rport = std::stoi(val);
+                next.rport = std::stoi(val);
             }
             else if (key == "BBFILE" && !val.empty()) {
-                cfg.bbfile = val;
+                next.bbfile = val;
             }
             else if (key == "PEER" && !val.empty()) {
                 auto col = val.rfind(':');
@@ -168,7 +176,7 @@ bool initialize(const char* configPath, Config& cfg) {
                     Peer p;
                     p.host = val.substr(0, col);
                     p.port = std::stoi(val.substr(col + 1));
-                    cfg.peers.push_back(p);
+                    next.peers.push_back(p);
                 }
             }
         }
@@ -176,24 +184,25 @@ bool initialize(const char* configPath, Config& cfg) {
         start = end + 1;
     }
 
-    if (cfg.bbfile.empty()) {
+    if (next.bbfile.empty()) {
         std::cerr << "Configuration error: BBFILE is required\n";
         return false;
     }
 
-    std::cout << "THMAX      = " << cfg.thmax      << "\n";
-    std::cout << "THINCR     = " << cfg.thincr     << "\n";
-    std::cout << "BBPORT     = " << cfg.bbport     << "\n";
-    std::cout << "FOREGROUND = " << (cfg.foreground ? "true" : "false") << "\n";
-    std::cout << "PDEBUG     = " << (cfg.pdebug     ? "true" : "false") << "\n";
-    std::cout << "RPORT      = " << cfg.rport      << "\n";
-    std::cout << "BBFILE     = " << cfg.bbfile     << "\n";
-    std::cout << "PEERS      = " << cfg.peers.size() << "\n";
-    for (auto& p : cfg.peers) {
+    std::cout << "THMAX      = " << next.thmax      << "\n";
+    std::cout << "THINCR     = " << next.thincr     << "\n";
+    std::cout << "BBPORT     = " << next.bbport     << "\n";
+    std::cout << "FOREGROUND = " << (next.foreground ? "true" : "false") << "\n";
+    std::cout << "PDEBUG     = " << (next.pdebug     ? "true" : "false") << "\n";
+    std::cout << "RPORT      = " << next.rport      << "\n";
+    std::cout << "BBFILE     = " << next.bbfile     << "\n";
+    std::cout << "PEERS      = " << next.peers.size() << "\n";
+    for (auto& p : next.peers) {
         std::cout << "  PEER     = " << p.host << ":" << p.port << "\n";
     }
     std::cout.flush();
 
+    cfg = std::move(next);
     return true;
 }
 
@@ -860,7 +869,7 @@ void runServer() {
         return;
     }
 
-    spawnThreads(g_cfg.thincr);
+    spawnThreads(std::min(g_cfg.thincr, g_cfg.thmax));
 
     // replica accept loop in background thread
     std::thread replicaThread([replicaFd]() {
@@ -899,8 +908,10 @@ void runServer() {
             break;
         }
 
-        if ((int)g_workers.size() < g_cfg.thmax) {
-            spawnThreads(g_cfg.thincr);
+        int current = (int)g_workers.size();
+        if (current < g_cfg.thmax) {
+            int toSpawn = std::min(g_cfg.thincr, g_cfg.thmax - current);
+            if (toSpawn > 0) spawnThreads(toSpawn);
         }
 
         enqueueClient(newFd);
@@ -925,6 +936,14 @@ void runServer() {
 /* ─────────────────────────────────────────────
    Main
    ───────────────────────────────────────────── */
+// Resolve a (possibly relative) BBFILE path against the original cwd, so
+// it stays valid after we chdir into SAFE_DIR and across SIGHUP reloads.
+static void resolveBbfilePath(Config& cfg) {
+    if (!cfg.bbfile.empty() && cfg.bbfile[0] != '/') {
+        cfg.bbfile = g_origCwd + "/" + cfg.bbfile;
+    }
+}
+
 int main(int argc, char* argv[]) {
     const char* path = DEFAULT_CONF;
 
@@ -941,6 +960,17 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         close(fd);
+    }
+
+    // Record the launch cwd before any chdir so we can resolve BBFILE
+    // (and any other relative paths) consistently across SIGHUP reloads.
+    {
+        char cwdbuf[4096];
+        if (getcwd(cwdbuf, sizeof(cwdbuf)) != nullptr) {
+            g_origCwd = cwdbuf;
+        } else {
+            g_origCwd = ".";
+        }
     }
 
     if (!initialize(path, g_cfg)) {
@@ -967,11 +997,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    ftruncate(g_pidFd, 0);
+    if (ftruncate(g_pidFd, 0) < 0) {
+        perror("ftruncate pid file");
+    }
     lseek(g_pidFd, 0, SEEK_SET);
     char buf[32];
     int n = snprintf(buf, 32, "%d\n", (int)getpid());
-    write(g_pidFd, buf, (size_t)n);
+    if (write(g_pidFd, buf, (size_t)n) != n) {
+        perror("write pid file");
+    }
     fsync(g_pidFd);
 
     if (chdir(SAFE_DIR) != 0) {
@@ -979,9 +1013,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (g_cfg.bbfile[0] != '/') {
-        g_cfg.bbfile = "../" + g_cfg.bbfile;
-    }
+    resolveBbfilePath(g_cfg);
 
     int bbfd = open(g_cfg.bbfile.c_str(), O_RDWR | O_CREAT, 0644);
     if (bbfd >= 0) close(bbfd);
@@ -1002,7 +1034,14 @@ int main(int argc, char* argv[]) {
         }
         if (g_doRestart) {
             logMsg("Server restarting");
-            initialize(path, g_cfg);
+            if (initialize(path, g_cfg)) {
+                // re-resolve BBFILE against the original cwd since
+                // initialize() resets the config struct and we're still
+                // chdir'd inside SAFE_DIR.
+                resolveBbfilePath(g_cfg);
+            } else {
+                logMsg("Reload failed, continuing with previous config");
+            }
         }
     }
 
