@@ -1,0 +1,304 @@
+CS 464/564 - Assignment 4 Report
+Replicated Bulletin Board Server (rbbserv)
+
+
+1. Overview
+
+This is the A3 bulletin board server extended into a production-ish
+daemon with distributed replication. Three big things got added on top
+of A3: (i) daemonization with a PID lock file, (ii) SIGHUP dynamic
+reconfiguration and SIGQUIT graceful shutdown, (iii) two-phase commit
+replication across any number of peer servers. The client-facing
+protocol (USER / READ / WRITE / REPLACE / QUIT) is unchanged from A3.
+
+All the code lives in a single file, rbbserv.cpp, built by the
+Makefile. The server takes one optional argument: the path to a config
+file (default ./bbserv.conf).
+
+
+2. Startup and daemonization
+
+The startup path follows the standard daemon recipe. Double fork so
+the server isn't a session leader, setsid in between, close all the
+file descriptors above stderr, reopen stdin/stdout/stderr to
+/dev/null. After that the server takes an exclusive flock on
+run/rbbserv.pid, writes its PID in, and refuses to start if the lock
+is already held. Using flock rather than "read the file and check if
+the PID is alive" avoids the TOCTOU race when two copies launch
+simultaneously, and it also auto-releases if the previous server died
+without cleaning up.
+
+After the PID file is locked the server chdir's into run/. That's the
+"safe directory" the assignment mentions. Log file (run/bbserv.log)
+and PID file naturally live here. The one thing that does NOT live in
+run/ is the bulletin board file - the assignment says BBFILE should be
+opened as specified in the config, not inside the safe directory. So
+before chdir, the server records its original working directory in
+g_origCwd, and any relative BBFILE is rewritten to an absolute path
+against that cwd. This is done through a small helper,
+resolveBbfilePath(), which also gets called after every SIGHUP reload
+so the BBFILE path keeps working even if the user changes it in the
+config.
+
+If FOREGROUND is 1 in the config, the server skips the daemonize step
+entirely and stays attached to the terminal. In that mode
+stdin/stdout/stderr are left alone and log messages go to stdout
+instead of the log file. Useful for testing; required by the
+assignment.
+
+
+3. Signal handling
+
+Signal handlers are minimal - they set atomic boolean flags
+(g_doRestart, g_doQuit) and return. No heavy work, no logging, no
+locks touched inside the handler, which keeps things async-signal-safe.
+
+The main accept loop (in runServer) uses select() with a 1-second
+timeout on the listening socket, so the server wakes up at least once
+a second to re-check the flags. Same deal for the replica accept
+thread. That means a signal is noticed within ~1s rather than whenever
+the next client happens to connect.
+
+The table of handled signals:
+
+  SIGHUP   -> g_doRestart = true.  The accept loop exits, workers
+              drain, the config is re-read, the server goes back to
+              runServer() with the new config.
+  SIGQUIT  -> g_doQuit = true.  Same drain as SIGHUP, then exit.
+  SIGINT   -> Only handled when FOREGROUND is set, and treated the
+              same as SIGQUIT.  In daemon mode it's ignored (Ctrl-C
+              shouldn't reach a daemon anyway, but better safe).
+  SIGPIPE, SIGTERM, SIGTSTP, SIGTTIN, SIGTTOU -> ignored, as required.
+
+
+4. Thread pool
+
+The pool is a std::queue<int> of accepted client file descriptors,
+protected by a mutex and a condition variable. Worker threads block
+on the condition variable, pop an fd when one arrives, and call
+handleClient. When handleClient returns, the worker loops back to
+wait for the next fd.
+
+Pool growth happens in the accept loop: if the current number of
+workers is less than THMAX, spawn min(THINCR, THMAX - current) more.
+The min is important - without it, if current is THMAX-1 and THINCR
+is 10, you'd end up with THMAX+9 threads, which violates the
+configured limit.
+
+Pool shrinking wasn't implemented - the assignment doesn't require
+it. On SIGHUP the entire pool is joined and a fresh batch of THINCR
+workers is spawned with the (possibly new) config, which effectively
+resets the pool size.
+
+
+5. Bulletin board file access
+
+A single mutex, g_fileMtx, protects all reads and writes to
+messages.txt. The operations are append (for WRITE), in-place line
+rewrite (for REPLACE), line removal (for undoWrite), and full-file
+scan (for readMessageById).
+
+A full readers/writers lock would give better throughput, but for an
+assignment with low message volume the simpler single-mutex design
+trades a little concurrency for a lot fewer ways to get it wrong.
+Every bbfile operation is short (a few kilobytes of I/O) so
+contention isn't realistically an issue.
+
+The file format is one record per line: <id>/<poster>/<text>\n.
+Parsing is done with std::string::find('/') - tolerant of any
+non-conforming line in the file (those get silently skipped), which
+matches the "any weird input file is OK" hint in the A3 handout.
+
+
+6. Dynamic reconfiguration (SIGHUP)
+
+When SIGHUP arrives, the accept loop exits, the queue's condition
+variable is notified, all workers finish their current request and
+return from handleClient, and the worker threads are joined. At that
+point the server is single-threaded again and runs initialize() a
+second time.
+
+initialize() parses into a LOCAL Config struct and only assigns it to
+g_cfg at the end, on success. This means:
+
+  - A syntactically bad config doesn't corrupt the running
+    configuration - the server keeps the old one and logs a warning.
+  - PEER lines don't accumulate across reloads. A common bug when
+    reloading a config is to push_back onto an existing vector; with
+    a fresh Config each time, that's structurally impossible.
+  - All fields (THMAX, THINCR, booleans, ports) reset to their defaults
+    on every parse, so removing a line from the config brings the
+    field back to its default rather than leaving the previous value.
+
+After initialize(), resolveBbfilePath() is called again to re-apply
+the absolute path against g_origCwd, since initialize() resets
+bbfile to whatever the config says (usually a relative path).
+
+runServer() then starts over with fresh worker threads and fresh
+listener sockets.
+
+
+7. Two-phase commit - master side
+
+The master is whichever server received the WRITE or REPLACE command
+from the client. Its job is to drive the 2PC round across all peers
+listed in the config.
+
+Phase 1 - precommit:
+  - Connect TCP to each peer's RPORT. Connect itself uses a 5-second
+    timeout (non-blocking socket + select on writability + SO_ERROR
+    check) so a dead peer is detected quickly instead of hanging for
+    the kernel's default connect timeout.
+  - Send "2PC PRECOMMIT\n" to each peer.
+  - Wait up to 5 seconds for each peer's reply.
+  - If any peer replies "2PC ACK FAIL", times out, or the connection
+    drops, broadcast "2PC ABORT" to the peers that already ACK'd OK,
+    close everything, and reply "3.2 ERROR WRITE replication failed"
+    to the client. Nothing is written anywhere.
+
+Phase 2 - commit:
+  - Send "2PC COMMIT WRITE <poster> <text>" (or "2PC COMMIT REPLACE
+    <id> <poster> <text>") to every peer.
+  - Also perform the operation locally.
+  - Wait up to 5 seconds for each peer's "2PC DONE OK" or
+    "2PC DONE FAIL".
+  - If all peers DONE OK and the local operation succeeded, broadcast
+    "2PC SUCCESS", reply "3.0 WROTE <id>" (or REPLACED) to the
+    client. Done.
+  - Otherwise broadcast "2PC UNSUCCESS", roll back the local
+    operation (undoWrite for WRITE, restore the saved original record
+    for REPLACE), reply "3.2 ERROR" to the client.
+
+Peers are contacted sequentially rather than in parallel. Parallel
+would be faster with many peers, but sequential keeps the code
+obvious, and with ~2-3 peers the latency difference is negligible.
+
+
+8. Two-phase commit - slave side
+
+Each incoming connection on RPORT spawns a detached std::thread
+running handleReplica. The slave side walks the same PRECOMMIT ->
+COMMIT -> SUCCESS/UNSUCCESS path in the obvious way, with 5-second
+timeouts on every recv.
+
+Only one 2PC transaction may be active on a given slave at a time,
+enforced by the atomic flag g_slaveBusy (set/cleared under
+g_slaveMtx). If a new PRECOMMIT arrives while busy, the slave
+replies "2PC ACK FAIL" and closes the connection. This is what
+causes two concurrent masters (one write on each side of a two-replica
+setup at the same moment) to produce at most one successful write -
+the second one aborts at PRECOMMIT. This is intentional: consistency
+over availability.
+
+Rollback on the slave side uses the same functions as on the master:
+undoWrite for a committed WRITE, or writing the saved original
+record back for REPLACE. The slave records the original record's
+content before performing a REPLACE, so it can put it back
+byte-for-byte if UNSUCCESS arrives. If the slave times out waiting
+for SUCCESS/UNSUCCESS after sending DONE OK, it conservatively rolls
+back - the assumption being that a silent master is more likely to
+have aborted than committed.
+
+
+9. Message IDs
+
+Each replica assigns its own IDs, via a std::atomic<int> g_nextId
+seeded at startup to max(existing_id) + 1. The ID returned to the
+client is always the local master's ID. Slaves generate their own IDs
+during COMMIT WRITE.
+
+This relies on the assumption that all replicas start with identical
+bulletin board files. If they do, local ID generation keeps them
+synchronized forever, since every WRITE goes through 2PC and so every
+replica increments exactly once per committed write.
+
+An alternative design would be for the master to put its chosen ID in
+the COMMIT WRITE message, so slaves don't have to agree independently.
+That would be more robust to out-of-sync bootstrap, but for this
+assignment the simpler local-counter approach is enough and matches
+the A3 semantics.
+
+
+10. Wire protocol for 2PC
+
+The full specification is in replproto.txt. Short version: plain
+text, line-oriented, "2PC " prefix on every message to separate
+replication traffic from anything else. CRLF is accepted (telnet
+compatible) because every recv strips '\r'.
+
+
+11. Testing
+
+Tested the following scenarios on a local Linux box:
+
+(a) Standalone mode (no PEER lines). WRITE, READ, REPLACE, READ of
+    unknown ID, REPLACE with bad format, QUIT. All responses match
+    the A3 protocol.
+
+(b) Two replicas on the same machine, different BBPORT/RPORT. WRITE
+    on rep1, READ on rep2 - message appears on rep2. WRITE on rep2,
+    READ on rep1 - message appears on rep1. Both messages.txt files
+    are byte-identical after the round-trip.
+
+(c) Two replicas, one killed. WRITE on the surviving replica returns
+    3.2 ERROR WRITE replication failed, and messages.txt remains
+    unchanged on the survivor. Restart the dead replica, retry the
+    WRITE - succeeds, both files in sync.
+
+(d) PDEBUG 1 with a single replicated WRITE - full wire trace is
+    visible in the log, showing PRECOMMIT / ACK OK / COMMIT WRITE /
+    DONE OK / SUCCESS on both sides in the expected order.
+
+(e) SIGHUP with a modified config - PEER list updates, THMAX/THINCR
+    honored, BBFILE path survives correctly (this one was a bug in
+    an earlier revision: after chdir into run/, the relative bbfile
+    became "./messages.txt" relative to run/; fixed by resolving
+    BBFILE against the recorded launch cwd on every reload).
+
+(f) Duplicate instance - starting a second ./rbbserv in the same
+    directory while the first is running fails immediately with
+    "Server already running", PID of existing instance visible in
+    run/rbbserv.pid.
+
+(g) Telnet - using telnet as the client works because the server
+    strips '\r' on receive. CRLF line endings are transparent.
+
+(h) SIGQUIT / Ctrl-C (foreground) - server drains and exits cleanly,
+    PID file removed, log file flushed and closed.
+
+
+12. Limitations and tradeoffs worth mentioning
+
+- Thread pool only grows, never shrinks. A long-running server that
+  sees a burst of clients will keep those threads around forever.
+  Not required by the assignment.
+
+- Message IDs are generated locally per replica. This is fine as
+  long as replicas start with identical bulletin board files, which
+  is the expected deployment. See Section 9.
+
+- 2PC peer connections are sequential in phase 1. For >3 peers a
+  parallel connect would help; for 2-3 peers, sequential is fine
+  and simpler.
+
+- g_slaveBusy is a server-wide flag, not per-client. A slave in the
+  middle of a 2PC transaction rejects new precommits from anywhere.
+  This is the conservative choice and what the assignment's
+  algorithm in Figure 1 implies.
+
+- No authentication, no TLS. The 2PC port is plain text on the
+  internal network. Fine for the J118 lab, obviously not fine for a
+  real deployment, but out of scope.
+
+
+13. Files shipped
+
+  rbbserv.cpp      server source
+  Makefile         builds rbbserv (default target)
+  bbserv.conf      example configuration
+  replproto.txt    full spec of the 2PC application protocol
+  README.md        how to build, configure, and use the server
+  Report           this file
+  stop.sh          convenience wrapper around kill -QUIT
+  messages.txt     bulletin board data file (created empty if absent)
+  run/             safe directory, auto-created at startup
